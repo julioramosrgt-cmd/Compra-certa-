@@ -224,12 +224,120 @@ async function loop(){
 }
 function stopScan(){if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}camera.classList.add('hidden')}
 
-async function readReceipt(){
-const f=receiptFile.files[0];if(!f)return;ocrStatus.textContent='Preparando OCR…';prog.classList.remove('hidden');ocrText.classList.remove('hidden');
-try{const {data}=await Tesseract.recognize(f,'por+eng',{logger:m=>{if(m.progress)prog.value=Math.round(m.progress*100);if(m.status)ocrStatus.textContent=m.status+'…'}});ocrText.textContent=data.text;receipt=parseReceipt(data.text);localStorage.setItem('cc_receipt',JSON.stringify(receipt));ocrStatus.textContent='✅ Leitura concluída. Revise os itens reconhecidos abaixo.';renderReceipt();renderDiff()}catch(e){ocrStatus.textContent='Não foi possível ler o cupom: '+e.message}}
+async function preprocessReceiptImage(file){
+  return new Promise((resolve,reject)=>{
+    const img=new Image();
+    const url=URL.createObjectURL(file);
+    img.onload=()=>{
+      try{
+        const maxW=1800;
+        const scale=Math.min(1,maxW/img.naturalWidth);
+        const w=Math.max(1,Math.round(img.naturalWidth*scale));
+        const h=Math.max(1,Math.round(img.naturalHeight*scale));
+        const canvas=document.createElement('canvas'); canvas.width=w; canvas.height=h;
+        const ctx=canvas.getContext('2d',{willReadFrequently:true});
+        ctx.drawImage(img,0,0,w,h);
+        const data=ctx.getImageData(0,0,w,h), d=data.data;
+        // Grayscale + binarização: texto escuro vira preto e papel/fundo vira branco.
+        for(let i=0;i<d.length;i+=4){
+          const gray=Math.round(0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]);
+          const v=gray<185?0:255;
+          d[i]=d[i+1]=d[i+2]=v;
+        }
+        ctx.putImageData(data,0,0);
+        canvas.toBlob(blob=>{URL.revokeObjectURL(url);blob?resolve(blob):reject(new Error('Falha no pré-processamento'))},'image/png');
+      }catch(e){URL.revokeObjectURL(url);reject(e)}
+    };
+    img.onerror=()=>{URL.revokeObjectURL(url);reject(new Error('Não foi possível abrir a imagem'))};
+    img.src=url;
+  });
+}
+function filterReceiptLine(line){
+  return String(line||'')
+    .normalize('NFC')
+    .replace(/[=<>~@\\|\[\]{}_*^`#$%&]/g,' ')
+    .replace(/[^A-Za-zÀ-ÖØ-öø-ÿ0-9 ,\.]/g,' ')
+    .replace(/\s+/g,' ')
+    .trim();
+}
+function filterReceiptOCR(text){
+  return String(text||'').split(/\r?\n/).map(filterReceiptLine).filter(Boolean);
+}
+function moneyFromBR(raw){
+  if(!raw)return NaN;
+  let v=String(raw).replace(/[^0-9,.]/g,'');
+  if(v.includes(',')) v=v.replace(/\./g,'').replace(',','.');
+  else if((v.match(/\./g)||[]).length>1) v=v.replace(/\./g,'');
+  return parseFloat(v);
+}
+function looksLikeReceiptName(s){
+  s=String(s||'').replace(/^\d{1,4}\s+/,'').trim();
+  if(!s || s.length<3)return false;
+  const letters=(s.match(/[A-Za-zÀ-ÖØ-öø-ÿ]/g)||[]).length;
+  const digits=(s.match(/\d/g)||[]).length;
+  const words=s.split(/\s+/).filter(Boolean);
+  if(letters<2 || letters<Math.max(2,Math.ceil((letters+digits)*0.25)))return false;
+  if(/^(?:\d+\s*)+$/.test(s))return false;
+  if(words.length===1 && digits>letters)return false;
+  return true;
+}
 function parseReceipt(text){
-let out=[];for(let line of text.split(/\n+/)){line=line.trim();if(!line)continue;let ms=[...line.matchAll(/(?:R\$\s*)?(\d{1,5}[.,]\d{2})/g)];if(!ms.length)continue;let m=ms[ms.length-1],value=parseFloat(m[1].replace(/\./g,'').replace(',','.'));let desc=line.slice(0,m.index).replace(/^\d+\s*/,'').trim();let qmatch=desc.match(/^(\d+)\s*[xX]\s*(.*)$/);let qty=qmatch?+qmatch[1]:1;if(qmatch)desc=qmatch[2].trim();if(desc&&value>0&&value<10000)out.push({desc,value,qty})}return out.slice(-100)}
-function renderReceipt(){let box=document.getElementById('receiptItems');box.innerHTML=receipt.length?receipt.map((x,i)=>`<div class=item><b>${esc(x.desc)}</b><div class=meta>Qtd: ${x.qty} · Valor reconhecido: ${money(x.value)}</div><button class=red onclick="receipt.splice(${i},1);localStorage.setItem('cc_receipt',JSON.stringify(receipt));renderReceipt();renderDiff()">Remover</button></div>`).join(''):'<div class=muted>Nenhum item reconhecido.</div>'}
+  const lines=filterReceiptOCR(text), out=[];
+  for(let raw of lines){
+    const line=raw.replace(/\s+/g,' ').trim();
+    const vals=[...line.matchAll(/(?:R\$\s*)?(\d{1,6}(?:[.,]\d{2}))/g)];
+    if(!vals.length)continue;
+    // Em cupons, o último valor costuma ser o total da linha e o anterior o unitário.
+    const last=vals[vals.length-1];
+    const total=moneyFromBR(last[1]);
+    if(!Number.isFinite(total) || total<=0 || total>=100000)continue;
+
+    let before=line.slice(0,last.index).trim();
+    let qty=1;
+    let unit=vals.length>1?moneyFromBR(vals[vals.length-2][1]):total;
+
+    // Padrão comum: DESCRIÇÃO 1 UN X 14,90 = 14,90
+    const qx=before.match(/(?:^|\s)(\d+(?:[.,]\d+)?)\s*(?:X|UN)\s*(?:R\$\s*)?(\d{1,6}(?:[.,]\d{2}))\s*$/i);
+    if(qx){
+      qty=parseFloat(qx[1].replace(',','.'))||1;
+      unit=moneyFromBR(qx[2]);
+      before=before.slice(0,qx.index).trim();
+    }else{
+      // Variações: 1 X 14,90 / 1 UN / 2,000 KG etc.
+      const q2=before.match(/(?:^|\s)(\d+(?:[.,]\d+)?)\s*(?:X|UN)\s*$/i);
+      if(q2){qty=parseFloat(q2[1].replace(',','.'))||1;before=before.slice(0,q2.index).trim()}
+      else {
+        const q3=before.match(/(?:^|\s)(\d+(?:[.,]\d+)?)\s*(?:UN|UND)\s*$/i);
+        if(q3){qty=parseFloat(q3[1].replace(',','.'))||1;before=before.slice(0,q3.index).trim()}
+      }
+    }
+    // Remove código numérico inicial típico do item.
+    let desc=before.replace(/^\d{1,6}\s+/,'').trim();
+    // Se ainda houver valor monetário no fim da descrição, remova-o.
+    desc=desc.replace(/(?:R\$\s*)?\d{1,6}(?:[.,]\d{2})\s*$/,'').trim();
+    const validName=looksLikeReceiptName(desc);
+    if(!validName) desc='PRODUTO RECONHECIDO';
+    out.push({desc,value:total,qty:qty>0?qty:1,unit:Number.isFinite(unit)?unit:total,raw:line,editable:true});
+  }
+  return out.slice(-100);
+}
+async function readReceipt(){
+  const f=receiptFile.files[0];if(!f)return;
+  ocrStatus.textContent='Preparando imagem do cupom…';prog.classList.remove('hidden');ocrText.classList.remove('hidden');prog.value=0;
+  try{
+    const processed=await preprocessReceiptImage(f);
+    ocrStatus.textContent='Aplicando OCR no cupom em escala de cinzas…';
+    const {data}=await Tesseract.recognize(processed,'por+eng',{logger:m=>{if(m.progress)prog.value=Math.round(m.progress*100);if(m.status)ocrStatus.textContent=m.status+'…'}});
+    const filteredLines=filterReceiptOCR(data.text||'');
+    const cleanText=filteredLines.join('\n');
+    ocrText.textContent=cleanText;
+    receipt=parseReceipt(cleanText);
+    localStorage.setItem('cc_receipt',JSON.stringify(receipt));
+    ocrStatus.textContent=receipt.length?'✅ Cupom processado. Revise os itens abaixo e corrija os nomes quando necessário.':'⚠️ Texto detectado, mas nenhum item com preço foi identificado. Tente fotografar o cupom mais próximo, sem reflexos e com boa iluminação.';
+    renderReceipt();renderDiff();
+  }catch(e){ocrStatus.textContent='Não foi possível processar o cupom: '+e.message}
+}
+function renderReceipt(){let box=document.getElementById('receiptItems');box.innerHTML=receipt.length?receipt.map((x,i)=>`<div class=item><input value="${esc(x.desc)}" aria-label="Nome do produto" onchange="receipt[${i}].desc=this.value.trim()||'PRODUTO RECONHECIDO';localStorage.setItem('cc_receipt',JSON.stringify(receipt));renderDiff()"><div class=meta>Qtd: ${x.qty} · Valor reconhecido: ${money(x.value)}${x.unit&&Math.abs(x.unit-x.value)>0.001?' · Unitário: '+money(x.unit):''}</div><button class=red onclick="receipt.splice(${i},1);localStorage.setItem('cc_receipt',JSON.stringify(receipt));renderReceipt();renderDiff()">Remover</button></div>`).join(''):'<div class=muted>Nenhum item reconhecido.</div>'}
 function normalize(s){return s.toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g,'').replace(/[^a-z0-9 ]/g,' ').replace(/\\s+/g,' ').trim()}
 function similarity(a,b){a=normalize(a);b=normalize(b);if(!a||!b)return 0;if(a.includes(b)||b.includes(a))return .9;let A=new Set(a.split(' ')),B=new Set(b.split(' '));let inter=[...A].filter(x=>B.has(x)).length;return inter/Math.max(A.size,B.size)}
 function renderDiff(){let box=document.getElementById('diffs');if(!cart.length||!receipt.length){box.innerHTML='<div class=muted>Adicione produtos e leia um cupom.</div>';return}let rows=[];for(let c of cart){let best=null,score=0;for(let r of receipt){let s=similarity(c.name,r.desc);if(s>score){score=s;best=r}}if(best&&score>=.45){let unit=best.value/(best.qty||1),d=unit-c.price;rows.push({c,best,score,unit,d})}else rows.push({c,best:null,score:0,unit:null,d:null})}
