@@ -100,34 +100,95 @@ async function photo(k){
   if(k==='expiry') await readExpiryPhoto(f);
 }
 
+function strictOCRText(text){
+  // Remove símbolos/ruído de OCR, mantendo letras latinas, acentos comuns e números.
+  const allowed=/[^A-Za-zÁÉÍÓÚÂÊÔÃÕÀÇáéíóúâêôãõàç0-9\s]/g;
+  return String(text||'')
+    .normalize('NFC')
+    .replace(/[«»<>+€£$©®™°ºª§|{}\[\]\\_~`^*=]/g,' ')
+    .replace(allowed,' ')
+    .replace(/\s+/g,' ')
+    .trim();
+}
+function isConfusingOCRName(value){
+  const s=strictOCRText(value);
+  if(!s) return true;
+  const tokens=s.split(' ').filter(Boolean);
+  const letters=(s.match(/[A-Za-zÁÉÍÓÚÂÊÔÃÕÀÇáéíóúâêôãõàç]/g)||[]).length;
+  const digits=(s.match(/\d/g)||[]).length;
+  const words=tokens.filter(t=>/[A-Za-zÁÉÍÓÚÂÊÔÃÕÀÇáéíóúâêôãõàç]{2,}/.test(t));
+  const singleNoise=tokens.filter(t=>t.length===1 && !/^[aA]$/.test(t));
+  if(s.length<4 || letters<4 || words.length===0) return true;
+  if(digits > Math.max(4, letters)) return true;
+  if(singleNoise.length > 1) return true;
+  if(tokens.length>1 && words.length/tokens.length < 0.5) return true;
+  // Sequências típicas de OCR ilegível: muitos números separados por espaços.
+  if(/(?:\b\d\b\s*){3,}/.test(s)) return true;
+  return false;
+}
+function bestOCRName(text){
+  const lines=String(text||'').split(/\n+/).map(strictOCRText).filter(Boolean);
+  const candidates=lines
+    .map(line=>line.replace(/\s+/g,' ').trim())
+    .filter(line=>!isConfusingOCRName(line))
+    .filter(line=>line.length>=4 && line.length<=80)
+    .filter(line=>!/^\d+(?:[,.]\d+)?\s?(?:kg|g|mg|l|ml|cl)$/i.test(line));
+  if(!candidates.length) return '';
+  candidates.sort((a,b)=>{
+    const score=x=>{
+      const letters=(x.match(/[A-Za-zÁÉÍÓÚÂÊÔÃÕÀÇáéíóúâêôãõàç]/g)||[]).length;
+      const words=x.split(' ').length;
+      return letters + Math.min(words,6)*3 - (x.match(/\d/g)||[]).length*2;
+    };
+    return score(b)-score(a);
+  });
+  return candidates[0];
+}
 async function identifyProductFromPhoto(file){
  const status=document.getElementById('productAI'); status.textContent='🔎 Analisando foto do produto…';
  try{
    let text='';
    if(window.Tesseract){const r=await Tesseract.recognize(file,'por+eng'); text=r.data.text||'';}
-   const clean=text.split(/\n+/).map(x=>x.trim()).filter(Boolean);
-   const joined=clean.join(' ');
-   // Tenta extrair peso/volume, sabor e tipo diretamente do texto da embalagem.
+   const safeText=strictOCRText(text);
+   const name=bestOCRName(text);
+   const joined=safeText;
    const spec=[];
    const measures=joined.match(/\b\d+(?:[,.]\d+)?\s?(?:kg|g|mg|l|ml|cl)\b/ig); if(measures) spec.push(...measures.slice(0,3));
    const flavors=joined.match(/\b(?:chocolate|morango|baunilha|limão|limao|queijo|presunto|frango|carne|original|tradicional|integral|zero|light|diet|natural|coco|uva|laranja|maçã|maca|menta|pimenta|bacon)\b/ig); if(flavors) spec.push(...[...new Set(flavors)].slice(0,3));
-   const nameCandidates=clean.filter(x=>/[A-Za-zÀ-ÿ]{3}/.test(x)&&x.length>2&&x.length<80).filter(x=>!/^\d+[,.]?\d*\s?(g|kg|ml|l)$/i.test(x));
-   if(nameCandidates.length && !document.getElementById('name').value) document.getElementById('name').value=nameCandidates[0];
+   const eans=joined.match(/\b\d{13}\b/g)||[]; const ean=eans[0];
+   // Nunca preenche o nome com OCR confuso. Se houver EAN, a consulta à OFF terá prioridade.
+   if(name && !document.getElementById('name').value) document.getElementById('name').value=name;
    if(spec.length && !document.getElementById('spec').value) document.getElementById('spec').value=[...new Set(spec)].join(' · ');
-   // Procura EAN no texto OCR e tenta consultar Open Food Facts.
-   const eans=joined.match(/\b\d{8,14}\b/g)||[]; const ean=eans.find(x=>/^\d{8}|\d{12,14}$/.test(x));
    if(ean && !document.getElementById('barcode').value) { document.getElementById('barcode').value=ean; await lookupBarcode(ean); }
-   status.textContent='✅ Foto analisada. Revise nome, especificação e código antes de adicionar.';
- }catch(e){status.textContent='⚠️ Não foi possível identificar automaticamente. Preencha os campos manualmente.'}
+   if(!name && !ean) document.getElementById('name').value='';
+   status.textContent=name||ean?'✅ Foto analisada. Revise os dados antes de adicionar.':'⚠️ Não foi possível identificar um nome confiável na foto. O campo Nome foi deixado em branco.';
+ }catch(e){
+   document.getElementById('name').value='';
+   status.textContent='⚠️ OCR ilegível. O campo Nome foi deixado em branco.';
+ }
 }
 async function lookupBarcode(code){
- try{const r=await fetch('https://world.openfoodfacts.org/api/v2/product/'+encodeURIComponent(code)+'.json'); const j=await r.json(); if(j.status!==1)return;
-   const p=j.product||{}; const n=p.product_name_pt||p.product_name||''; const brand=p.brands||'';
-   const attrs=[p.quantity,p.flavor,p.generic_name_pt||p.generic_name].filter(Boolean).join(' · ');
-   if(n) document.getElementById('name').value=(brand&&n.toLowerCase().indexOf(brand.toLowerCase())<0?brand+' ':'')+n;
-   if(attrs) document.getElementById('spec').value=attrs;
-   document.getElementById('productAI').textContent='✅ Produto localizado pelo código de barras (Open Food Facts). Confira os dados da embalagem.';
- }catch(e){}
+ const ean=String(code||'').replace(/\D/g,'');
+ if(!/^\d{13}$/.test(ean)) return false;
+ try{
+   const r=await fetch('https://world.openfoodfacts.org/api/v2/product/'+encodeURIComponent(ean)+'.json?fields=product_name_pt,product_name,brands,generic_name_pt,generic_name,quantity,flavor,flavor_pt,categories_tags');
+   if(!r.ok) return false;
+   const j=await r.json();
+   if(j.status!==1) return false;
+   const p=j.product||{};
+   const n=p.product_name_pt||p.product_name||'';
+   const brand=p.brands||'';
+   const attrs=[p.generic_name_pt||p.generic_name,p.quantity,p.flavor_pt||p.flavor].filter(Boolean).join(' · ');
+   if(n){
+     const fullName=(brand&&n.toLowerCase().indexOf(brand.toLowerCase())<0?brand+' ':'')+n;
+     document.getElementById('name').value=strictOCRText(fullName);
+   }
+   if(attrs) document.getElementById('spec').value=strictOCRText(attrs);
+   document.getElementById('productAI').textContent='✅ Produto localizado pelo código de barras na Open Food Facts. Dados preenchidos automaticamente.';
+   return true;
+ }catch(e){
+   return false;
+ }
 }
 async function readShelfLabel(file){
  try{const r=await Tesseract.recognize(file,'por+eng'); const text=r.data.text||''; const prices=[...text.matchAll(/(?:R\$\s*)?(\d{1,4}[.,]\d{2})/g)].map(m=>m[1].replace(',','.')); if(prices.length&&!document.getElementById('price').value) document.getElementById('price').value=prices[prices.length-1];
@@ -135,8 +196,32 @@ async function readShelfLabel(file){
  }catch(e){document.getElementById('productAI').textContent='⚠️ Não foi possível ler a etiqueta automaticamente.'}
 }
 async function readExpiryPhoto(file){try{const r=await Tesseract.recognize(file,'por+eng');const t=r.data.text||'';const m=t.match(/\b(\d{1,2})[\/-](\d{1,2})[\/-](\d{2,4})\b/);if(m){let y=m[3].length===2?'20'+m[3]:m[3];document.getElementById('expiry').value=y+'-'+String(m[2]).padStart(2,'0')+'-'+String(m[1]).padStart(2,'0');document.getElementById('productAI').textContent='📅 Validade identificada pela foto. Confira antes de adicionar.'}}catch(e){}}
-async function scan(){document.getElementById('camera').classList.remove('hidden');try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}}});video.srcObject=stream;await video.play();if('BarcodeDetector' in window){detector=new BarcodeDetector({formats:['ean_13','ean_8','upc_a','upc_e','code_128','itf']});loop()}else scanMsg.textContent='Leitura automática indisponível; digite o código manualmente.'}catch(e){scanMsg.textContent='Permita o acesso à câmera ou digite o código.'}}
-async function loop(){if(!stream)return;try{let c=await detector.detect(video);if(c.length){barcode.value=c[0].rawValue;scanMsg.textContent='✅ '+c[0].rawValue;stopScan();return}}catch(e){}requestAnimationFrame(loop)}
+async function scan(){
+ document.getElementById('camera').classList.remove('hidden');
+ try{
+   try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{exact:'environment'}}});}
+   catch(e){stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});}
+   video.srcObject=stream; await video.play();
+   if('BarcodeDetector' in window){
+     detector=new BarcodeDetector({formats:['ean_13']});
+     loop();
+   }else scanMsg.textContent='Leitura EAN-13 indisponível neste navegador; digite o código manualmente.';
+ }catch(e){scanMsg.textContent='Permita o acesso à câmera traseira ou digite o código.'}
+}
+async function loop(){
+ if(!stream)return;
+ try{
+   let c=await detector.detect(video);
+   if(c.length){
+     const code=String(c[0].rawValue||'').replace(/\D/g,'');
+     if(/^\d{13}$/.test(code)){
+       barcode.value=code; scanMsg.textContent='🔎 EAN-13: '+code+' — consultando Open Food Facts…';
+       stopScan(); await lookupBarcode(code); return;
+     }
+   }
+ }catch(e){}
+ requestAnimationFrame(loop);
+}
 function stopScan(){if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}camera.classList.add('hidden')}
 
 async function readReceipt(){
@@ -156,96 +241,12 @@ function newPurchase(){if(confirm('Apagar a compra atual deste aparelho?')){cart
 render();
 </script>
 <script>
-/* PWA: manifest embutido + tentativa de Service Worker inline.
-   Observação técnica: navegadores Chromium normalmente exigem que o script
-   do Service Worker tenha a mesma origem da página. Por isso, blob: pode ser
-   recusado por política de segurança mesmo que o Blob seja válido. */
-(function () {
-  if (!('serviceWorker' in navigator)) return;
-
-  const swCode = `
-    const CACHE_NAME = 'compra-certa-inline-v1';
-    self.addEventListener('install', event => {
-      event.waitUntil(
-        caches.open(CACHE_NAME)
-          .then(cache => cache.addAll(['./']))
-          .then(() => self.skipWaiting())
-      );
-    });
-    self.addEventListener('activate', event => {
-      event.waitUntil(self.clients.claim());
-    });
-    self.addEventListener('fetch', event => {
-      if (event.request.method !== 'GET') return;
-      event.respondWith(
-        caches.match(event.request).then(cached => {
-          return cached || fetch(event.request).then(response => {
-            const copy = response.clone();
-            caches.open(CACHE_NAME).then(cache => cache.put(event.request, copy));
-            return response;
-          }).catch(() => cached);
-        })
-      );
-    });
-  `;
-
-  window.addEventListener('load', async () => {
-    try {
-      const blob = new Blob([swCode], { type: 'application/javascript' });
-      const blobUrl = URL.createObjectURL(blob);
-      await navigator.serviceWorker.register(blobUrl, { scope: './' });
-      console.log('Compra Certa: Service Worker inline registrado.');
-    } catch (error) {
-      console.warn(
-        'Compra Certa: o navegador bloqueou Service Worker via Blob URL. ' +
-        'Isto é uma restrição de segurança do navegador, não um erro do app.',
-        error
-      );
-    }
+// Service Worker em arquivo separado e mesma origem: necessário para PWA/offline confiável no Vercel.
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js', {scope:'./'})
+      .catch(err => console.warn('Service Worker:', err));
   });
-})();
+}
 </script>
-
-
-<script>
-/* Botão opcional de instalação. O Chrome só dispara beforeinstallprompt
-   quando todos os critérios de instalação do navegador forem satisfeitos. */
-(function () {
-  let deferredPrompt = null;
-
-  const addInstallButton = () => {
-    if (document.getElementById('installAppBtn')) return;
-    const btn = document.createElement('button');
-    btn.id = 'installAppBtn';
-    btn.textContent = '📲 Instalar aplicativo';
-    btn.className = 'sec';
-    btn.style.cssText = 'position:fixed;right:12px;top:12px;z-index:1000;display:none;';
-    document.body.appendChild(btn);
-
-    btn.addEventListener('click', async () => {
-      if (!deferredPrompt) return;
-      deferredPrompt.prompt();
-      try { await deferredPrompt.userChoice; } catch (_) {}
-      deferredPrompt = null;
-      btn.style.display = 'none';
-    });
-  };
-
-  window.addEventListener('DOMContentLoaded', addInstallButton);
-
-  window.addEventListener('beforeinstallprompt', event => {
-    event.preventDefault();
-    deferredPrompt = event;
-    const btn = document.getElementById('installAppBtn');
-    if (btn) btn.style.display = 'block';
-  });
-
-  window.addEventListener('appinstalled', () => {
-    deferredPrompt = null;
-    const btn = document.getElementById('installAppBtn');
-    if (btn) btn.style.display = 'none';
-  });
-})();
-</script>
-
 </body></html>
